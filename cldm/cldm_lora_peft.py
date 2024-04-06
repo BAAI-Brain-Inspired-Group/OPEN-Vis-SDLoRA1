@@ -7,6 +7,8 @@ import sys
 import numpy as np
 import random
 from einops import rearrange, repeat,reduce
+from .cldm import HyperColumnLGN
+from peft import LoraConfig, get_peft_model
 
 from hypercolumn.vit_pytorch.train_V1_sep_new import Column_trans_rot_lgn
 
@@ -20,126 +22,17 @@ from ldm.modules.diffusionmodules.util import (
 from einops import rearrange, repeat
 from torchvision.utils import make_grid
 from ldm.modules.attention import SpatialTransformer
-from ldm.modules.diffusionmodules.openaimodel import UNetModel, TimestepEmbedSequential, ResBlock, Downsample, AttentionBlock
+from ldm.modules.diffusionmodules.openaimodel import TimestepEmbedSequential, ResBlock, Downsample, AttentionBlock
 from ldm.models.diffusion.ddpm import LatentDiffusion
 from ldm.util import log_txt_as_img, exists, instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
-
-
-class ControlledUnetModel(UNetModel):
-    def forward(self, x, timesteps=None, context=None, control=None, only_mid_control=False, **kwargs):
-        hs = []
-        with torch.no_grad():
-            t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
-            emb = self.time_embed(t_emb)
-            h = x.type(self.dtype)
-            for module in self.input_blocks:
-                h = module(h, emb, context)
-                hs.append(h)
-            h = self.middle_block(h, emb, context)
-
-        if control is not None:
-            h += control.pop()
-
-        for i, module in enumerate(self.output_blocks):
-            if only_mid_control or control is None:
-                h = torch.cat([h, hs.pop()], dim=1)
-            else:
-                h = torch.cat([h, hs.pop() + control.pop()], dim=1)
-            h = module(h, emb, context)
-
-        h = h.type(x.dtype)
-        return self.out(h)
 
 def disabled_train(self, mode=True):
     """Overwrite model.train with this function to make sure train/eval mode
     does not change anymore."""
     return self
 
-class HyperColumnLGN(nn.Module):
-    def __init__(self,key=0,hypercond=[0],restore_ckpt = './pretrained/equ_nv16_vl4_rn1_Bipolar_norm.pth'):
-        super().__init__()
-        ckpt = torch.load(restore_ckpt, map_location='cpu')
-        hc = Column_trans_rot_lgn(ckpt['arg'])
-        hc.load_state_dict(ckpt['state_dict'], strict=False)
-        self.lgn_ende = hc.lgn_ende[0].eval()
-        self.lgn_ende.train = disabled_train
-        
-        for param in self.lgn_ende.parameters():
-            param.requires_grad = False
-
-        # self.groups = [[2,3],[0,1,4,8,9,15],[5,6,7,10,12],[11,13,14]]
-        self.groups = [[0,1,4,8,9,15],[2,3],[5,12],[10],[6,7],[11,13,14]]
-            
-        # self.p = [1.,0.5,0.25,0.125]
-        self.p = [0. for i in range(len(self.groups))]
-        self.p[0] = 1.
-
-        norm_mean = np.array([0.50705882, 0.48666667, 0.44078431])
-        norm_std = np.array([0.26745098, 0.25568627, 0.27607843])
-        self.norm = transforms.Normalize(norm_mean, norm_std)
-        self.cond = hypercond
-        self.slct = None
-
-    # def forward(self,x):
-    #     s = x.size()
-    #     r = torch.zeros(1,16,1,1).to(x.device)
-
-    #     if self.cond is None:
-    #         c = [i for i in range(len(self.groups))]
-    #         random.shuffle(c)
-    #         # print(self.groups[c[0]])
-    #         pa = random.random()
-    #         for i in range(4):
-    #             if pa < self.p[i]:
-    #                 for j in self.groups[c[i]]:
-    #                     r[:,j,:,:] = 1.
-    #     else:
-    #         for i in self.cond:
-    #             for j in self.groups[i]:
-    #                 r[:,j,:,:] = 1
-
-    #     r = repeat(r,'n c h w -> n (c repeat) h w',repeat=4)
-    #     return self.lgn_ende(self.norm(x))*r
-    
-    def forward(self,x):
-        s = x.size()
-        r = torch.zeros(1,16,1,1).to(x.device)
-
-        if self.cond is None:
-            c = [i for i in range(len(self.groups))]
-            random.shuffle(c)
-            # print(self.groups[c[0]])
-            pa = random.random()
-            for i in range(len(self.groups)):
-                if pa < self.p[i]:
-                    for j in self.groups[c[i]]:
-                        r[:,j,:,:] = 1.
-        else:
-            for i in self.cond:
-                for j in self.groups[i]:
-                    r[:,j,:,:] = 1
-
-        r = repeat(r,'n c h w -> n (c repeat) h w',repeat=4)
-        return self.lgn_ende.deconv(self.lgn_ende(self.norm(x))*r)
-    
-    def deconv(self,x):
-        s = x.size()
-        r = torch.zeros(1,16,1,1).to(x.device)
-        if self.cond is not None:
-            for i in self.cond:
-                for j in self.groups[i]:
-                    r[:,j,:,:] = 1
-
-        r = repeat(r,'n c h w -> n (c repeat) h w',repeat=4)
-        conv = self.lgn_ende(self.norm(x))*r
-        deconv = self.lgn_ende.deconv(conv)
-        deconv = (deconv - reduce(deconv,'b c h w -> b c () ()', 'min'))/(reduce(deconv,'b c h w -> b c () ()', 'max')-reduce(deconv,'b c h w -> b c () ()', 'min'))*2.-1.
-
-        return deconv
-
-
-class ControlNet(nn.Module):
+class ControLoraNet(nn.Module):
     def __init__(
             self,
             image_size,
@@ -239,39 +132,7 @@ class ControlNet(nn.Module):
         )
         self.zero_convs = nn.ModuleList([self.make_zero_conv(model_channels)])
 
-        # self.input_hint_block = TimestepEmbedSequential(
-        #     conv_nd(dims, hint_channels, 16, 3, padding=1),
-        #     nn.SiLU(),
-        #     conv_nd(dims, 16, 16, 3, padding=1),
-        #     nn.SiLU(),
-        #     conv_nd(dims, 16, 32, 3, padding=1, stride=2),
-        #     nn.SiLU(),
-        #     conv_nd(dims, 32, 32, 3, padding=1),
-        #     nn.SiLU(),
-        #     conv_nd(dims, 32, 96, 3, padding=1, stride=2),
-        #     nn.SiLU(),
-        #     conv_nd(dims, 96, 96, 3, padding=1),
-        #     nn.SiLU(),
-        #     conv_nd(dims, 96, 256, 3, padding=1, stride=2),
-        #     nn.SiLU(),
-        #     zero_module(conv_nd(dims, 256, model_channels, 3, padding=1))
-        # )
-
-        # self.input_hint_block_new = TimestepEmbedSequential(
-        #     HyperColumnLGN(),
-        #     # nn.SiLU(),
-        #     conv_nd(dims, 64, 64, 3, padding=1),
-        #     nn.SiLU(),
-        #     conv_nd(dims, 64, 128, 3, padding=1,stride=2),
-        #     nn.SiLU(),
-        #     conv_nd(dims, 128, 128, 3, padding=1,stride=1),
-        #     nn.SiLU(),
-        #     conv_nd(dims, 128, 256, 3, padding=1,stride=1),
-        #     nn.SiLU(),
-        #     zero_module(conv_nd(dims, 256, model_channels, 3, padding=1))
-        # )
-
-        self.input_hint_block_new = TimestepEmbedSequential(
+        self.input_hint_block = TimestepEmbedSequential(
             HyperColumnLGN(hypercond=hypercond),
             # nn.SiLU(),
             conv_nd(dims, hint_channels, 16, 3, padding=1),
@@ -407,6 +268,38 @@ class ControlNet(nn.Module):
         self.middle_block_out = self.make_zero_conv(ch)
         self._feature_size += ch
 
+        for param in self.parameters():
+            param.requires_grad_(False)
+
+        self.init_lora()
+
+    def init_lora(
+            self, 
+            rank: int = 4,
+            alpha: int = 32,
+            dropout: float = 0.,
+            lora_conv2d_rank: int = 4,
+    ):
+        peft_config = LoraConfig(
+            r=rank, 
+            lora_alpha=alpha, 
+            lora_dropout=dropout,
+            init_lora_weights="gaussian",
+            target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        )
+
+        self = get_peft_model(self, peft_config)
+
+        for n, param in self.named_parameters():
+            if 'input_hint_block' in n and 'input_hint_block.0' not in n:
+                param.requires_grad_(True)
+            if 'zero_convs' in n:
+                param.requires_grad_(True)
+
+        self.print_trainable_parameters()
+
+        self = torch.compile(self)
+
     def make_zero_conv(self, channels):
         return TimestepEmbedSequential(zero_module(conv_nd(self.dims, channels, channels, 1, padding=0)))
 
@@ -417,8 +310,8 @@ class ControlNet(nn.Module):
 
         # print('ControlNet foward emb:',emb.size(),'hint:',hint.size(),'context:',context.size())
 
-        guided_hint = self.input_hint_block_new(hint, emb, context)
-        # print(self.input_hint_block_new)
+        guided_hint = self.input_hint_block(hint, emb, context)
+        # print(self.input_hint_block)
         # print('ControlNet foward emb:',emb.size(),'hint:',hint.size(),'context:',context.size(),'guided_hint:',guided_hint.size())
 
         outs = []
@@ -438,8 +331,7 @@ class ControlNet(nn.Module):
 
         return outs
 
-
-class ControlLDM(LatentDiffusion):
+class ControLoraLDM(LatentDiffusion):
 
     def __init__(self, control_stage_config, control_key, only_mid_control, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -452,10 +344,6 @@ class ControlLDM(LatentDiffusion):
     
     def training_step(self, batch, batch_idx):
         return super().training_step(batch, batch_idx)
-    
-    
-    # def validation_step(self, batch, batch_idx):
-    #     return super().training_step(batch, batch_idx)
 
     @torch.no_grad()
     def get_input(self, batch, k, bs=None, *args, **kwargs):
@@ -540,7 +428,7 @@ class ControlLDM(LatentDiffusion):
             uc_cat = c_cat  # torch.zeros_like(c_cat)
             uc_full = {"c_concat": [uc_cat], "c_crossattn": [uc_cross]}
             for slct in self.slct:
-                self.control_model.input_hint_block_new[0].cond = slct['cond']
+                self.control_model.input_hint_block[0].cond = slct['cond']
                 suffix = slct['suffix']
                 print(suffix)
                 samples_cfg, _ = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
@@ -550,10 +438,10 @@ class ControlLDM(LatentDiffusion):
                                                 unconditional_conditioning=uc_full,
                                                 )
                 x_samples_cfg = self.decode_first_stage(samples_cfg)
-                deconv = self.control_model.input_hint_block_new[0].deconv(c_cat)
+                deconv = self.control_model.input_hint_block[0].deconv(c_cat)
                 log[f"{suffix}_samples_cfg_scale_{unconditional_guidance_scale:.2f}"] = x_samples_cfg
                 log[f"{suffix}_deconv_samples_cfg_scale_{unconditional_guidance_scale:.2f}"] = deconv
-                # self.control_model.input_hint_block_new[0].cond = None
+                # self.control_model.input_hint_block[0].cond = None
 
         return log
 

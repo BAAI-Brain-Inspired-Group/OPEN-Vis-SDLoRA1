@@ -1,5 +1,6 @@
 import json
 import cv2
+import os
 import numpy as np
 from pycocotools.coco import COCO
 
@@ -73,12 +74,12 @@ class MyDatasetHC(Dataset):
         return dict(jpg=target, txt=prompt, hint=cond)
 
 class MyDatasetCOCO(Dataset):
-    def __init__(self):
+    def __init__(self, root='/home/chenzhiqiang/data/ms-coco'):
         self.data = []
-        path = '/home/chenzhiqiang/data/ms-coco/annotations/captions_train2017.json'
-        self.dir_train = '/home/chenzhiqiang/data/ms-coco/train2017'
-        self.dir_val = '/home/chenzhiqiang/data/ms-coco/val2017'
-        self.coco = COCO(path)
+        anno_path = os.path.join(root, 'annotations', 'captions_train2017.json') #FIXME: error in val
+        self.dir_train = os.path.join(root, 'train2017')
+        self.dir_val = os.path.join(root, 'val2017')
+        self.coco = COCO(anno_path)
         # self.data = self.coco.getImgIds()
         self.data = self.coco.loadImgs(self.coco.getImgIds())
         # self.anns = self.coco.loadAnns(self.coco.getAnnIds())
