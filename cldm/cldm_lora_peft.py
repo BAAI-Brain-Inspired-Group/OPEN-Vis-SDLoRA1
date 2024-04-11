@@ -7,8 +7,8 @@ import sys
 import numpy as np
 import random
 from einops import rearrange, repeat,reduce
-from .cldm import HyperColumnLGN
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, LoraModel, PeftMixedModel
+from ldm.util import default
 
 from hypercolumn.vit_pytorch.train_V1_sep_new import Column_trans_rot_lgn
 
@@ -23,14 +23,67 @@ from einops import rearrange, repeat
 from torchvision.utils import make_grid
 from ldm.modules.attention import SpatialTransformer
 from ldm.modules.diffusionmodules.openaimodel import TimestepEmbedSequential, ResBlock, Downsample, AttentionBlock
-from ldm.models.diffusion.ddpm import LatentDiffusion
+from ldm.models.diffusion.ddpm import LatentDiffusion, disabled_train
 from ldm.util import log_txt_as_img, exists, instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 
-def disabled_train(self, mode=True):
-    """Overwrite model.train with this function to make sure train/eval mode
-    does not change anymore."""
-    return self
+class HyperColumnLGN(nn.Module):
+    def __init__(self, restore_ckpt='./pretrained/equ_nv16_vl4_rn1_Bipolar_norm.pth'):
+        super().__init__()
+        ckpt = torch.load(restore_ckpt, map_location='cpu')
+        hc = Column_trans_rot_lgn(ckpt['arg'])
+        hc.load_state_dict(ckpt['state_dict'], strict=False)
+        self.lgn_ende = hc.lgn_ende[0].eval()
+        self.lgn_ende.train = disabled_train
+        
+        for param in self.lgn_ende.parameters():
+            param.requires_grad = False
+
+        self.groups = [[0,1,4,8,9,15],[2,3],[5,12],[10],[6,7],[11,13,14]]
+            
+        self.p = [0. for i in range(len(self.groups))]
+        self.p[0] = 1.
+
+        norm_mean = np.array([0.50705882, 0.48666667, 0.44078431])
+        norm_std = np.array([0.26745098, 0.25568627, 0.27607843])
+        self.norm = transforms.Normalize(norm_mean, norm_std)
+    
+    def forward(self, x, cond):
+        if cond is None:
+            r = torch.zeros(1,16,1,1).to(x.device)
+            c = [i for i in range(len(self.groups))]
+            random.shuffle(c)
+            # print(self.groups[c[0]])
+            pa = random.random()
+            for i in range(len(self.groups)):
+                if pa < self.p[i]:
+                    for j in self.groups[c[i]]:
+                        r[:,j,:,:] = 1.
+            res = self.lgn_ende.deconv(self.lgn_ende(self.norm(x))*r)
+        else:
+            res = []
+            for i in cond:
+                r = torch.zeros(1,16,1,1).to(x.device)
+                for j in self.groups[i]:
+                    r[:,j,:,:] = 1
+                r = repeat(r,'n c h w -> n (c repeat) h w',repeat=4)
+                deconv = self.lgn_ende.deconv(self.lgn_ende(self.norm(x))*r)
+                res.append(deconv)
+        return res
+    
+    def deconv(self, x, cond):
+        r = torch.zeros(1,16,1,1).to(x.device)
+        if cond is not None:
+            for i in cond:
+                for j in self.groups[i]:
+                    r[:,j,:,:] = 1
+
+        r = repeat(r,'n c h w -> n (c repeat) h w',repeat=4)
+        conv = self.lgn_ende(self.norm(x))*r
+        deconv = self.lgn_ende.deconv(conv)
+        deconv = (deconv - reduce(deconv,'b c h w -> b c () ()', 'min'))/(reduce(deconv,'b c h w -> b c () ()', 'max')-reduce(deconv,'b c h w -> b c () ()', 'min'))*2.-1.
+
+        return deconv
 
 class ControLoraNet(nn.Module):
     def __init__(
@@ -133,8 +186,6 @@ class ControLoraNet(nn.Module):
         self.zero_convs = nn.ModuleList([self.make_zero_conv(model_channels)])
 
         self.input_hint_block = TimestepEmbedSequential(
-            HyperColumnLGN(hypercond=hypercond),
-            # nn.SiLU(),
             conv_nd(dims, hint_channels, 16, 3, padding=1),
             nn.SiLU(),
             conv_nd(dims, 16, 16, 3, padding=1),
@@ -268,51 +319,14 @@ class ControLoraNet(nn.Module):
         self.middle_block_out = self.make_zero_conv(ch)
         self._feature_size += ch
 
-        for param in self.parameters():
-            param.requires_grad_(False)
-
-        self.init_lora()
-
-    def init_lora(
-            self, 
-            rank: int = 4,
-            alpha: int = 32,
-            dropout: float = 0.,
-            lora_conv2d_rank: int = 4,
-    ):
-        peft_config = LoraConfig(
-            r=rank, 
-            lora_alpha=alpha, 
-            lora_dropout=dropout,
-            init_lora_weights="gaussian",
-            target_modules=["to_k", "to_q", "to_v", "to_out.0"],
-        )
-
-        self = get_peft_model(self, peft_config)
-
-        for n, param in self.named_parameters():
-            if 'input_hint_block' in n and 'input_hint_block.0' not in n:
-                param.requires_grad_(True)
-            if 'zero_convs' in n:
-                param.requires_grad_(True)
-
-        self.print_trainable_parameters()
-
-        self = torch.compile(self)
-
     def make_zero_conv(self, channels):
         return TimestepEmbedSequential(zero_module(conv_nd(self.dims, channels, channels, 1, padding=0)))
 
     def forward(self, x, hint, timesteps, context, **kwargs):
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
-        # print('time_embed:',self.time_embed)
-
-        # print('ControlNet foward emb:',emb.size(),'hint:',hint.size(),'context:',context.size())
 
         guided_hint = self.input_hint_block(hint, emb, context)
-        # print(self.input_hint_block)
-        # print('ControlNet foward emb:',emb.size(),'hint:',hint.size(),'context:',context.size(),'guided_hint:',guided_hint.size())
 
         outs = []
 
@@ -332,30 +346,50 @@ class ControLoraNet(nn.Module):
         return outs
 
 class ControLoraLDM(LatentDiffusion):
-
-    def __init__(self, control_stage_config, control_key, only_mid_control, *args, **kwargs):
+    def __init__(self, control_stage_config, control_key, only_mid_control, hypercond, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.control_model = instantiate_from_config(control_stage_config)
         self.control_key = control_key
         self.only_mid_control = only_mid_control
         self.control_scales = [1.0] * 13
-        self.hypercond = control_stage_config['params']['hypercond']
-        self.select()
-    
-    def training_step(self, batch, batch_idx):
-        return super().training_step(batch, batch_idx)
+
+        self.hypercond_model = HyperColumnLGN()
+        self.hypercond = hypercond
+        self.hypercond_inference = None
+
+        self.init_lora()
+
+    def init_lora(
+            self, 
+            rank: int = 4,
+            alpha: int = 32,
+            dropout: float = 0.,
+            lora_conv2d_rank: int = 4,
+    ):
+        peft_config = LoraConfig(
+            r=rank, 
+            lora_alpha=alpha, 
+            lora_dropout=dropout,
+            init_lora_weights="gaussian",
+            target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+            modules_to_save=['input_hint_block'] + [f'zero_convs.{i}' for i in range(12)]
+        )
+
+        for i in self.hypercond:
+            if isinstance(self.control_model, PeftMixedModel):
+                self.control_model.add_adapter(adapter_name=f'lora{i}', peft_config=peft_config)
+            else:
+                self.control_model = PeftMixedModel(self.control_model, peft_config, adapter_name=f'lora{i}')
+
+        for n, param in self.control_model.named_parameters():
+            if 'lora' in n:
+                param.requires_grad_(True)
+            if 'modules_to_save' in n:
+                param.requires_grad_(True)
 
     @torch.no_grad()
     def get_input(self, batch, k, bs=None, *args, **kwargs):
-        x, c = super().get_input(batch, self.first_stage_key, *args, **kwargs)
-        control = batch[self.control_key]
-        # print('c:',c)
-        
-        if bs is not None:
-            control = control[:bs]
-        control = control.to(self.device)
-        control = einops.rearrange(control, 'b h w c -> b c h w')
-        control = control.to(memory_format=torch.contiguous_format).float()
+        x, c, control = super().get_input(batch, self.first_stage_key, *args, **kwargs, return_x=True)
         return x, dict(c_crossattn=[c], c_concat=[control])
 
     def apply_model(self, x_noisy, t, cond, *args, **kwargs):
@@ -367,11 +401,75 @@ class ControLoraLDM(LatentDiffusion):
         if cond['c_concat'] is None:
             eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=None, only_mid_control=self.only_mid_control)
         else:
-            control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt)
-            control = [c * scale for c, scale in zip(control, self.control_scales)]
-            eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control)
-
+            hint = torch.cat(cond['c_concat'], 1)
+            if self.hypercond_inference is None or self.hypercond_inference == ['all']:
+                conditions = self.hypercond_model(hint, self.hypercond)
+            else:
+                conditions = self.hypercond_model(hint, self.hypercond_inference)
+            if self.hypercond_inference == ['all']:
+                final_control = []
+                for i, cond in zip(self.hypercond, conditions):
+                    self.control_model.set_adapter(f'lora{i}')
+                    control = self.control_model(x=x_noisy, hint=cond, timesteps=t, context=cond_txt)
+                    if final_control == []: final_control = control
+                    else: final_control = [f+c for f, c in zip(final_control, control)]
+                control = [c * scale for c, scale in zip(final_control, self.control_scales)]
+                eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control)
+            else:
+                eps_all = []
+                for i, cond in zip(self.hypercond, conditions):
+                    self.control_model.set_adapter(f'lora{i}')
+                    control = self.control_model(x=x_noisy, hint=cond, timesteps=t, context=cond_txt)
+                    control = [c * scale for c, scale in zip(control, self.control_scales)]
+                    eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control)
+                    eps_all.append(eps.unsqueeze(0))
+                eps = torch.cat(eps_all, dim=0)
+        if self.hypercond_inference is None:
+            for n, param in self.control_model.named_parameters():
+                if 'lora' in n:
+                    param.requires_grad_(True)
+                if 'modules_to_save' in n:
+                    param.requires_grad_(True)
         return eps
+
+    def p_losses(self, x_start, cond, t, noise=None):
+        noise = default(noise, lambda: torch.randn_like(x_start))
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+        model_output = self.apply_model(x_noisy, t, cond)
+
+        loss_dict = {}
+        prefix = 'train' if self.training else 'val'
+
+        if self.parameterization == "x0":
+            target = x_start
+        elif self.parameterization == "eps":
+            target = noise
+        elif self.parameterization == "v":
+            target = self.get_v(x_start, noise, t)
+        else:
+            raise NotImplementedError()
+        
+        target = repeat(target, 'b c h w -> n b c h w', n=len(self.hypercond))
+
+        loss_simple = self.get_loss(model_output, target, mean=False).mean([0, 2, 3, 4])
+        loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
+
+        logvar_t = self.logvar[t].to(self.device)
+        loss = loss_simple / torch.exp(logvar_t) + logvar_t
+        # loss = loss_simple / torch.exp(self.logvar) + self.logvar
+        if self.learn_logvar:
+            loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
+            loss_dict.update({'logvar': self.logvar.data.mean()})
+
+        loss = self.l_simple_weight * loss.mean()
+
+        loss_vlb = self.get_loss(model_output, target, mean=False).mean([0, 2, 3, 4])
+        loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
+        loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
+        loss += (self.original_elbo_weight * loss_vlb)
+        loss_dict.update({f'{prefix}/loss': loss})
+
+        return loss, loss_dict
 
     @torch.no_grad()
     def get_unconditional_conditioning(self, N):
@@ -412,37 +510,26 @@ class ControLoraLDM(LatentDiffusion):
             diffusion_grid = make_grid(diffusion_grid, nrow=diffusion_row.shape[0])
             log["diffusion_row"] = diffusion_grid
 
-        if sample:
-            # get denoise row
-            samples, z_denoise_row = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
-                                                     batch_size=N, ddim=use_ddim,
-                                                     ddim_steps=ddim_steps, eta=ddim_eta)
-            x_samples = self.decode_first_stage(samples)
-            log["samples"] = x_samples
-            if plot_denoise_rows:
-                denoise_grid = self._get_denoise_row_from_list(z_denoise_row)
-                log["denoise_row"] = denoise_grid
-
         if unconditional_guidance_scale > 1.0:
             uc_cross = self.get_unconditional_conditioning(N)
             uc_cat = c_cat  # torch.zeros_like(c_cat)
             uc_full = {"c_concat": [uc_cat], "c_crossattn": [uc_cross]}
-            for slct in self.slct:
-                self.control_model.input_hint_block[0].cond = slct['cond']
-                suffix = slct['suffix']
+            for i in self.hypercond + ['all']:
+                suffix = f'{i}'
                 print(suffix)
+                self.hypercond_inference = [i]
                 samples_cfg, _ = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
-                                                batch_size=N, ddim=use_ddim,
-                                                ddim_steps=ddim_steps, eta=ddim_eta,
-                                                unconditional_guidance_scale=unconditional_guidance_scale,
-                                                unconditional_conditioning=uc_full,
-                                                )
+                                    batch_size=N, ddim=use_ddim,
+                                    ddim_steps=ddim_steps, eta=ddim_eta,
+                                    unconditional_guidance_scale=unconditional_guidance_scale,
+                                    unconditional_conditioning=uc_full,)
                 x_samples_cfg = self.decode_first_stage(samples_cfg)
-                deconv = self.control_model.input_hint_block[0].deconv(c_cat)
                 log[f"{suffix}_samples_cfg_scale_{unconditional_guidance_scale:.2f}"] = x_samples_cfg
-                log[f"{suffix}_deconv_samples_cfg_scale_{unconditional_guidance_scale:.2f}"] = deconv
-                # self.control_model.input_hint_block[0].cond = None
+                if i != 'all':
+                    deconv = self.hypercond_model.deconv(c_cat, [i])
+                    log[f"{suffix}_deconv_samples_cfg_scale_{unconditional_guidance_scale:.2f}"] = deconv
 
+        self.hypercond_inference = None
         return log
 
     @torch.no_grad()
@@ -473,11 +560,3 @@ class ControLoraLDM(LatentDiffusion):
             self.control_model = self.control_model.cpu()
             self.first_stage_model = self.first_stage_model.cuda()
             self.cond_stage_model = self.cond_stage_model.cuda()
-
-    @torch.no_grad()
-    def select(self):
-        # self.slct = [{'cond':[0],'suffix':'0'},{'cond':[1],'suffix':'1'},{'cond':[2],'suffix':'2'},{'cond':[3],'suffix':'3'},{'cond':[0,1],'suffix':'01'},
-        #              {'cond':[0,2],'suffix':'02'},{'cond':[0,3],'suffix':'03'},{'cond':[1,2],'suffix':'12'},{'cond':[1,3],'suffix':'13'},{'cond':[2,3],'suffix':'23'},
-        #              {'cond':[0,1,2],'suffix':'012'},{'cond':[0,1,3],'suffix':'013'},{'cond':[1,2,3],'suffix':'123'},
-        #              {'cond':[0,1,2,3],'suffix':'0123'}]
-        self.slct = [{'cond':[i],'suffix':f'{i}'} for i in self.hypercond]

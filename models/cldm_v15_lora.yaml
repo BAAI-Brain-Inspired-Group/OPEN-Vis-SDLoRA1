@@ -17,6 +17,7 @@ model:
     scale_factor: 0.18215
     use_ema: False
     only_mid_control: False
+    hypercond: [0,1]
 
     control_stage_config:
       target: cldm.cldm_lora_peft.ControLoraNet
@@ -34,8 +35,6 @@ model:
         context_dim: 768
         use_checkpoint: False
         legacy: False
-        hypercond: [0]
-
     unet_config:
       target: cldm.cldm.ControlledUnetModel
       params:
