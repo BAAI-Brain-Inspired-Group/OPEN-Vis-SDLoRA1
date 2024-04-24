@@ -14,7 +14,7 @@ Issues about ControlNet refer to (https://github.com/lllyasviel/ControlNet/blob/
 
 The checkpoint will be released soon.
 
-# Run the network, set model archtecture file, checkpoint file, logger file and dataset
+# Setting
 
 In file tutorial_train.py
 
@@ -25,18 +25,18 @@ control2_path = 'image_log/checkpoint_lora4/last.ckpt'
 
 In file ./models/cldm_v15_lora.yaml
 
-model:
-  target: cldm.cldm_lora_peft.ControLoraLDM
-  params:
-    control_stage_config:
-      target: cldm.cldm_lora_peft.ControLoraNet
-      params:
-        hypercond: [1]
+    model:
+    target: cldm.cldm_lora_peft.ControLoraLDM
+    params:
+        control_stage_config:
+        target: cldm.cldm_lora_peft.ControLoraNet
+        params:
+            hypercond: [1]
 
-    control_stage_config2:
-      target: cldm.cldm_lora_peft.ControLoraNet
-      params:
-        hypercond: [4]
+        control_stage_config2:
+        target: cldm.cldm_lora_peft.ControLoraNet
+        params:
+            hypercond: [4]
 
 
 # Run
