@@ -1,4 +1,4 @@
-# OPEN-Vis-ControlSD
+# OPEN-Vis-SDLoRA
 
 Our model is built upon our trained modular Hypercolumn-like features and ControlNet. The hypercolumn-like features are trained using a self-supervised method. Based on these features, we train several ControlNets. This approach utilizes a comprehensive modular feature set that is automatically learned and differentiated, resulting in robustness and generalization transfer capabilities. By configuring and combining appropriate control modules, it can effectively transfer to features without prior learning. This is a LoRA version based on ContralNet, which is efficient in learnable parameters for each hypercolumn. This version can easily use multiple hypercolumns to achieve controllable generation.
 
