@@ -40,9 +40,9 @@ In file ./models/cldm_v15_lora.yaml
 
 
 # Run
-
+```
 python tutorial_train.py
-
+```
 # Parameters
 
 ![alt text](github_page/parameter.png)
