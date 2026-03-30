@@ -21,6 +21,9 @@ In file tutorial_train.py
 resume_path = './image_log/checkpoint__lora1/last.ckpt'
 control2_path = 'image_log/checkpoint_lora4/last.ckpt'
 
+### checkpoints
+https://huggingface.co/Wistons/OPEN-Vis-SDLoRA
+
 # Selected hypercolumns
 
 In file ./models/cldm_v15_lora.yaml
